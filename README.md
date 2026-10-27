@@ -23,9 +23,9 @@ This installs `/usr/local/sbin/pentera-helper` and runs `fix-time` (below). Remo
 | `diagnose [--net\|--iface\|--time]` | Why did it fail? Always prints network info, interface roles, time and certificates, then a plain-language verdict. | no |
 | `status` | Read-only overview: NICs, roles, netplan mode, time, staged change, last verification. | no |
 | `wizard` | Interactive static/DHCP setup. | only if you confirm |
-| `set-static --ip A --cidr N --gw G [--dns a,b] [--iface IF]` | Static IP. Dry-run unless `--apply`. | with `--apply` |
-| `set-dhcp [--iface IF] [--dns a,b]` | DHCP. Dry-run unless `--apply`. | with `--apply` |
-| `sync-iface [--iface IF]` | Realign management/attack/compose to the real NIC. | with `--apply` |
+| `set-static --ip A --cidr N --gw G [--dns a,b] [--iface IF] [--verify-ip a,b]` | Static IP. Dry-run unless `--apply`. | with `--apply` |
+| `set-dhcp [--iface IF] [--dns a,b] [--verify-ip a,b]` | DHCP. Dry-run unless `--apply`. | with `--apply` |
+| `sync-iface [--iface IF] [--verify-ip a,b]` | Realign management/attack/compose to the real NIC. | with `--apply` |
 | `fix-time [--tz Area/City] [--rtc local\|utc\|auto]` | Time guardrails (see below). | no |
 | `regen-certs [--force]` | Re-mint node/UI certificates on the current clock (CA untouched). | restarts Pentera |
 | `commit` / `rollback` | Accept a staged change without the check / restore the last backup. | rollback reboots |
@@ -37,11 +37,33 @@ This installs `/usr/local/sbin/pentera-helper` and runs `fix-time` (below). Remo
 1. Backs up netplan, `network.conf` and the compose files (`/etc/pentera/backup/helper/net-*`).
 2. Writes the new config and syncs the interface into **all three** places (netplan, `network.conf`, compose).
 3. Reboots (10 s countdown, Ctrl-C cancels).
-4. After boot it checks itself: the gateway must answer within 90 s. If so the change is **kept**; if not, the
-   old config is **restored** and the box reboots once more. Pentera's certificates are re-issued for the new IP
-   by Pentera itself; the helper regenerates them if they come out future-dated.
+4. After boot it checks itself (within 90 s, ping or ARP if ping is blocked). The change passes if the **gateway
+   answers, or any `--verify-ip` host does**. Pentera's certificates are re-issued for the new IP by Pentera itself;
+   the helper regenerates them if they come out future-dated.
 
-Result of the last check: `pentera-helper status` (log: `/etc/pentera/backup/helper/last-apply.log`).
+| After boot | What happens |
+|---|---|
+| check passes | change **kept** |
+| fails, and the old gateway answered when you ran `--apply` (you are still on the old network) | old config **restored**, one more reboot |
+| fails, and the old gateway was already silent (you moved to another network) | new config **kept**, no second reboot: restoring the old config could not work here. Fix it at the console with `pentera-helper wizard`. |
+
+There is never a reboot loop: the check runs once, and removes itself before any automatic reboot, so one `--apply`
+causes at most two reboots. To cancel a pending check by hand:
+`sudo systemctl disable pentera-helper-verify && sudo rm /etc/pentera/backup/helper/pending.env`.
+
+**Choosing `--verify-ip`** (the wizard asks for it as step 4):
+
+- *Isolated VLAN, no internet:* give a neighbour or server on that VLAN, e.g. `--verify-ip 10.20.0.5`.
+- *Internet, but the gateway blocks ping:* give public IPs, e.g. `--verify-ip 8.8.8.8,1.1.1.1`.
+- Give both if you are not sure which kind of network you will land in. It is "gateway **or any** of them".
+
+Result of the last check: `pentera-helper status` (log: `/etc/pentera/backup/helper/last-apply.log`; the last line
+reads `RESULT: KEPT`, `REVERTED` or `FAILED-KEPT`).
+
+**Gateway rules.** Pentera needs a default route to start, so `set-static` and the wizard reject a gateway that
+the OS would drop: the network or broadcast address of the subnet (e.g. `.15` in a `/28`), an address outside the
+subnet, or the box's own IP. On an isolated VLAN with no real router, still give an *unused* address of the subnet as the
+gateway and use `--verify-ip` (a neighbour) for the connectivity check.
 
 ## Time and certificates (dual-boot laptops)
 

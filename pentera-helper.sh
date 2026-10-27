@@ -36,6 +36,7 @@ VERIFY_UNIT=pentera-helper-verify.service
 WAIT_TIME=/usr/local/sbin/pentera-wait-time
 DROPIN=/etc/systemd/system/pentera.service.d/10-wait-time-sync.conf
 NET_WAIT=${PH_NET_WAIT:-90}                   # seconds verify-boot waits for the gateway after reboot
+VERIFY_LIST=""                                # extra hosts to ping after the reboot (space separated, set by --verify-ip / wizard)
 
 RED=$'\e[31m'; GRN=$'\e[32m'; YEL=$'\e[33m'; CYN=$'\e[36m'; BLD=$'\e[1m'; RST=$'\e[0m'
 die(){ printf "${RED}error:${RST} %s\n" "$*" >&2; exit 1; }
@@ -48,6 +49,14 @@ phys_ifaces(){ local n b; for n in /sys/class/net/*; do b=${n##*/}; [ -e "$n/dev
 is_phys(){ grep -qw "$1" <<<"$(phys_ifaces)"; }
 primary_iface(){ local d; d=$(ip route 2>/dev/null | awk '/^default/{for(i=1;i<=NF;i++) if($i=="dev"){print $(i+1); exit}}'); [ -n "$d" ] && { echo "$d"; return; }; phys_ifaces | head -1; }
 default_gw(){ ip route 2>/dev/null | awk '/^default/{for(i=1;i<=NF;i++) if($i=="via"){print $(i+1); exit}}'; }
+# Is the gateway really there? ICMP first; many gateways drop ping but always answer ARP, so fall back to a fresh ARP check.
+gw_ok(){
+  local gw=${1:-} ifc=${2:-}
+  [ -n "$gw" ] || return 1
+  ip neigh flush to "$gw" ${ifc:+dev "$ifc"} >/dev/null 2>&1     # forget stale entries (root only) so the ARP is fresh
+  ping -c1 -W2 "$gw" >/dev/null 2>&1 && return 0
+  ip neigh show to "$gw" ${ifc:+dev "$ifc"} 2>/dev/null | grep -qE 'REACHABLE|STALE|DELAY'
+}
 get_conf(){ $SUDO awk -F'=' -v k="$1" '$0 ~ "^[[:space:]]*"k {gsub(/[[:space:]]/,"",$2);print $2;exit}' "$NCONF" 2>/dev/null; }
 get_compose_if(){ $SUDO grep -rhoE 'NETWORK_INTERFACE=[^[:space:]"]+' "$COMPOSE_DIR"/ 2>/dev/null | head -1 | cut -d= -f2; }
 netplan_mode(){ $SUDO grep -qE 'dhcp4:[[:space:]]*true' "$NETPLAN" 2>/dev/null && echo dhcp || { $SUDO grep -qE 'addresses:' "$NETPLAN" 2>/dev/null && echo static || echo unknown; }; }
@@ -67,7 +76,11 @@ net_report(){
   printf "uplink iface : %s (operstate=%s)  mac=%s\n" "$pif" "$state" "$(cat /sys/class/net/"$pif"/address 2>/dev/null)"
   printf "IPv4 address : %s   [%s]\n" "${ipv4:-"${RED}(none!)${RST}"}" "$(netplan_mode)"
   printf "default gw   : %s" "${gw:-"${RED}(none!)${RST}"}"
-  if [ -n "$gw" ]; then ping -c1 -W2 "$gw" >/dev/null 2>&1 && printf "  ${GRN}[ping OK]${RST}\n" || printf "  ${RED}[ping FAIL]${RST}\n"; else printf "\n"; fi
+  if [ -n "$gw" ]; then
+    if ping -c1 -W2 "$gw" >/dev/null 2>&1; then printf "  ${GRN}[ping OK]${RST}\n"
+    elif gw_ok "$gw" "$pif"; then printf "  ${YEL}[ping blocked, ARP OK]${RST}\n"
+    else printf "  ${RED}[ping FAIL]${RST}\n"; fi
+  else printf "\n"; fi
   [ "$(ip route 2>/dev/null | grep -c '^default')" -gt 1 ] && printf "${YEL}note         : more than one default route present${RST}\n"
   printf "DNS servers  : %s\n" "${dns:-"${RED}(none)${RST}"}"
   if getent hosts "$(hostname)" >/dev/null 2>&1; then printf "DNS resolver : ${GRN}OK${RST} (resolved own hostname)\n"
@@ -79,6 +92,9 @@ net_report(){
   for b in br_pentera docker0 attack_bridge; do
     [ -e /sys/class/net/$b ] && printf "note         : %s is %s — normal when pentera containers aren't running yet\n" "$b" "$(cat /sys/class/net/$b/operstate 2>/dev/null)"
   done
+  b=$($SUDO grep -E '^RESULT:' "$RESULT" 2>/dev/null | tail -1)
+  [ -n "$b" ] && printf "last change  : %s   (details: pentera-helper status)\n" "$b"
+  return 0
 }
 
 MM=""; mgmt_if=""; atk_if=""; comp_if=""
@@ -196,6 +212,12 @@ The attack bridge can't bind to a NIC that isn't there -> nodes fail. Usual caus
 appliance to a different VM/host/subnet.
 ${BLD}FIX:${RST} sudo pentera-helper sync-iface --apply"
   elif [ -n "$FUT" ]; then reason="$FUT_VERDICT"
+  elif [ -z "$(default_gw)" ]; then
+    reason="${RED}NO DEFAULT ROUTE${RST} and Pentera is not running — the likely cause. Pentera's start fails at its host-id/settings
+step when the box has no default gateway.
+Usual reason: a gateway the OS refuses (the network/broadcast address, or outside the subnet), or none configured.
+${BLD}FIX:${RST} sudo pentera-helper wizard   (or set-static with a valid --gw). On an isolated VLAN with no real router,
+     still give an unused address of the subnet as the gateway; --verify-ip covers the connectivity check."
   fi
   if [ -z "$reason" ]; then case "$fatal_comp" in
     BATTERY)
@@ -371,12 +393,20 @@ EOF
 }
 
 stage_reboot(){   # $1 backup dir   $2 expected gateway ("" = take it from DHCP after boot)   $3 iface
-  local bk=$1 gw=$2 ifc=$3
+  local bk=$1 gw=$2 ifc=$3 oldgw oldok=0
+  # Is the OLD network still where we are? (the new config is only written, not live yet, so this still tests the old one.)
+  # If its gateway is already silent the box was moved to another network, and restoring that config could not help.
+  oldgw=$(default_gw); gw_ok "$oldgw" "$ifc" && oldok=1
   install_self; install_verify_unit
-  printf "BK='%s'\nGW='%s'\nIFACE='%s'\nSTAGED='%s'\n" "$bk" "$gw" "$ifc" "$(date -u +%FT%TZ)" > "$PENDING"
+  printf "BK='%s'\nGW='%s'\nIFACE='%s'\nSTAGED='%s'\nOLD_GW='%s'\nOLD_OK='%s'\nTARGETS='%s'\n" "$bk" "$gw" "$ifc" "$(date -u +%FT%TZ)" "$oldgw" "$oldok" "$VERIFY_LIST" > "$PENDING"
   systemctl enable "$VERIFY_UNIT" >/dev/null 2>&1
   sec "Staged"
-  printf "  backup  : %s\n  verify  : after boot, gateway %s must answer within %ss — otherwise the old config is restored\n" "$bk" "${gw:-"(from DHCP)"}" "$NET_WAIT"
+  printf "  backup  : %s\n  verify  : after boot, within %ss the gateway %s must answer (ping or ARP)%s\n" "$bk" "$NET_WAIT" "${gw:-"(from DHCP)"}" "${VERIFY_LIST:+ — or any of: $VERIFY_LIST}"
+  if [ "$oldok" = 1 ]; then
+    printf "  on fail : the old config is restored and the box reboots once more (the old gateway %s answers now, so you are still on the old network)\n" "$oldgw"
+  else
+    printf "  ${YEL}on fail : the NEW config is KEPT, no revert${RST} — the old gateway (%s) does not answer now, so you are on another network\n            and restoring the old config would not help. Fix it at the console:  sudo pentera-helper wizard\n" "${oldgw:-none}"
+  fi
   # the next boot reads the hardware clock — make sure it holds correct UTC
   if ntp_synced; then hwclock --systohc && printf "  clock   : hardware clock set from the synced clock (the next boot starts on the right time)\n"
   else printf "  ${YEL}clock   : NTP not synced — hardware clock not touched${RST}\n"; fi
@@ -388,22 +418,34 @@ stage_reboot(){   # $1 backup dir   $2 expected gateway ("" = take it from DHCP 
 }
 
 cmd_verify_boot(){   # run once by pentera-helper-verify.service after the reboot
-  systemctl disable "$VERIFY_UNIT" >/dev/null 2>&1      # one-shot: never runs again unless re-staged
+  # No reboot loop is possible: the unit disables itself FIRST, and $PENDING is removed before any reboot,
+  # so one --apply causes at most one automatic revert (2 reboots total) and then nothing runs again.
+  systemctl disable "$VERIFY_UNIT" >/dev/null 2>&1
   [ -f "$PENDING" ] || exit 0
-  local BK GW IFACE STAGED gw i ok=0 fut
-  . "$PENDING"
+  local BK GW IFACE STAGED OLD_GW OLD_OK TARGETS gw i t proof="" ok=0 fut
+  . "$PENDING"; OLD_OK=${OLD_OK:-1}; TARGETS=${TARGETS:-}
   exec >>"$RESULT" 2>&1
   echo "=== verify-boot $(date -u +%FT%TZ)  (staged $STAGED, iface $IFACE) ==="
   for i in $(seq 1 $(( NET_WAIT / 3 ))); do
     gw=${GW:-$(default_gw)}
-    if [ -n "$gw" ] && ping -c1 -W2 "$gw" >/dev/null 2>&1; then ok=1; break; fi
+    if gw_ok "$gw" "$IFACE"; then ok=1; proof="gateway $gw reachable"; break; fi
+    for t in $TARGETS; do
+      if gw_ok "$t" "$IFACE"; then ok=1; proof="gateway ${gw:-none} silent, but test host $t answers"; break 2; fi
+    done
     sleep 3
   done
   if [ "$ok" != 1 ]; then
-    echo "network: FAILED — gateway '${gw:-none}' unreachable after ${NET_WAIT}s -> restoring $BK and rebooting"
-    restore_backup "$BK"; rm -f "$PENDING"; echo "RESULT: REVERTED"; sync; systemctl reboot; exit 0
+    if [ "$OLD_OK" = 1 ]; then
+      echo "network: FAILED — gateway '${gw:-none}'${TARGETS:+ and test hosts ($TARGETS)} unreachable after ${NET_WAIT}s -> restoring $BK and rebooting"
+      restore_backup "$BK"; rm -f "$PENDING"; echo "RESULT: REVERTED"; sync; systemctl reboot; exit 0
+    fi
+    echo "network: FAILED — gateway '${gw:-none}'${TARGETS:+ and test hosts ($TARGETS)} unreachable after ${NET_WAIT}s"
+    echo "the old gateway (${OLD_GW:-none}) did not answer when this was staged, so the box was not on the old network;"
+    echo "restoring the old config would not help -> KEEPING the new config, no further reboot."
+    echo "fix at the console:  sudo pentera-helper wizard      (old config backup: $BK)"
+    rm -f "$PENDING"; echo "RESULT: FAILED-KEPT"; exit 0
   fi
-  echo "network: OK — gateway $gw reachable, $IFACE = $(ip -4 -o addr show dev "$IFACE" 2>/dev/null | awk '{print $4}')"
+  echo "network: OK — $proof, $IFACE = $(ip -4 -o addr show dev "$IFACE" 2>/dev/null | awk '{print $4}')"
   for i in $(seq 1 240); do [ "$(systemctl is-active "$SVC")" = active ] && break; sleep 5; done
   echo "pentera: $(systemctl is-active "$SVC")"
   fut=$(future_certs)
@@ -437,6 +479,20 @@ gen_netplan(){ local mode=$1 ifc=$2 ip=${3:-} cidr=${4:-} gw=${5:-} dns=${6:-}
   fi
 }
 valid_ip(){ [[ "$1" =~ ^([0-9]{1,3}\.){3}[0-9]{1,3}$ ]] || return 1; local o; for o in ${1//./ }; do [ "$o" -le 255 ] || return 1; done; }
+ip2int(){ local a b c d; IFS=. read -r a b c d <<<"$1"; echo $(( (a<<24) + (b<<16) + (c<<8) + d )); }
+# Is this a usable ip/prefix/gateway combination? Prints the reason and returns 1 when not.
+# (a gateway on the network or broadcast address, or outside the subnet, is silently dropped by the OS -> no default
+#  route -> Pentera cannot start)
+gw_check(){   # ip prefix gateway
+  local ipn gwn mask net bc
+  [[ "$2" =~ ^[0-9]+$ ]] && [ "$2" -ge 8 ] && [ "$2" -le 30 ] || { echo "prefix /$2 is not usable (use 8-30)"; return 1; }
+  ipn=$(ip2int "$1"); gwn=$(ip2int "$3")
+  mask=$(( (0xFFFFFFFF << (32 - $2)) & 0xFFFFFFFF )); net=$(( ipn & mask )); bc=$(( net | (~mask & 0xFFFFFFFF) ))
+  { [ "$ipn" -ne "$net" ] && [ "$ipn" -ne "$bc" ]; } || { echo "$1 is the network/broadcast address of $1/$2, not a host address"; return 1; }
+  [ $(( gwn & mask )) -eq "$net" ] || { echo "gateway $3 is outside the subnet of $1/$2"; return 1; }
+  { [ "$gwn" -ne "$net" ] && [ "$gwn" -ne "$bc" ]; } || { echo "gateway $3 is the network/broadcast address of $1/$2 — the OS would drop the route and Pentera could not start"; return 1; }
+  [ "$gwn" -ne "$ipn" ] || { echo "gateway $3 is the same as the host IP"; return 1; }
+}
 
 plan_netplan(){   # mode iface ip cidr gw dns apply
   local mode=$1 ifc=$2 ip=$3 cidr=$4 gw=$5 dns=$6 apply=$7 yaml
@@ -461,7 +517,9 @@ plan_roles(){   # iface apply
   grep -rlE 'NETWORK_INTERFACE=' "$COMPOSE_DIR"/ 2>/dev/null | while read -r f; do sed -i -E "s|(NETWORK_INTERFACE=)[^[:space:]\"]+|\1$ifc|g" "$f"; done
 }
 
-dry_note(){ printf "\n${CYN}(dry-run — add --apply to write these and reboot; the box verifies itself after boot)${RST}\n"; }
+dry_note(){
+  printf "\n  verify after boot: gateway%s\n" "${VERIFY_LIST:+ — or any of: $VERIFY_LIST}"
+  printf "${CYN}(dry-run — add --apply to write these and reboot; the box verifies itself after boot)${RST}\n"; }
 
 # ============================================================
 # wizard
@@ -470,7 +528,7 @@ cmd_wizard(){
   [ "$(id -u)" -eq 0 ] || die "run the wizard with sudo:  sudo pentera-helper wizard"
   exec 3<>/dev/tty || die "wizard needs an interactive terminal (tty)"
   w(){ printf "%b" "$*" >&3; }
-  local def mgmt mode ip="" cidr="" gw="" dns="" atk ans i n; declare -a NICS
+  local def mgmt mode ip="" cidr="" gw="" dns="" atk ans i n bad; declare -a NICS
   w "${BLD}+----------------------------------------------+\n"
   w "|       Pentera Helper — Network Setup          |\n"
   w "+----------------------------------------------+${RST}\n"
@@ -490,7 +548,12 @@ cmd_wizard(){
     mode=static
     while :; do w "   IP address            : "; read -r -u 3 ip; valid_ip "$ip" && break || w "   ${RED}invalid IP, try again${RST}\n"; done
     w "   Prefix / CIDR [24]    : "; read -r -u 3 cidr; cidr=${cidr:-24}
-    while :; do w "   Gateway               : "; read -r -u 3 gw; valid_ip "$gw" && break || w "   ${RED}invalid gateway, try again${RST}\n"; done
+    while :; do
+      w "   Gateway               : "; read -r -u 3 gw
+      valid_ip "$gw" || { w "   ${RED}invalid gateway, try again${RST}\n"; continue; }
+      bad=$(gw_check "$ip" "$cidr" "$gw") && break
+      w "   ${RED}$bad${RST}\n   (even on an isolated VLAN give an unused address of the subnet — Pentera needs a default route)\n"
+    done
     w "   DNS (comma) [8.8.8.8] : "; read -r -u 3 dns; dns=${dns:-8.8.8.8}
   fi
 
@@ -502,11 +565,25 @@ cmd_wizard(){
   else atk=$mgmt; fi
   is_phys "$atk" || die "invalid attack interface: $atk"
 
+  w "\n${BLD}4) Connectivity check after the reboot${RST}\n"
+  w "   The gateway is always tested. Add IPs to ping as well: the change is KEPT if the gateway OR any of them answers.\n"
+  w "     - isolated VLAN (no internet): a neighbour or server on that VLAN, e.g. 10.20.0.5\n"
+  w "     - with internet: public IPs, e.g. 8.8.8.8, 1.1.1.1   (also covers a gateway that blocks ping)\n"
+  while :; do
+    w "   Extra IPs (comma separated, blank = gateway only): "; read -r -u 3 ans
+    VERIFY_LIST=""; bad=""
+    for n in ${ans//,/ }; do if valid_ip "$n"; then VERIFY_LIST="${VERIFY_LIST:+$VERIFY_LIST }$n"; else bad="$n"; fi; done
+    [ -z "$bad" ] && break
+    w "   ${RED}invalid IP: $bad — try again${RST}\n"
+  done
+
   w "\n${BLD}Review${RST}\n"
   w "   management = $mgmt\n   attack     = $atk\n   mode       = $mode\n"
   [ "$mode" = static ] && w "   address    = $ip/$cidr\n   gateway    = $gw\n"
   w "   dns        = ${dns:-auto}\n"
-  w "\n   The box will REBOOT to apply, then check itself (gateway reachable -> kept, else old config restored).\n"
+  w "   check      = gateway${VERIFY_LIST:+ or any of: $VERIFY_LIST}\n"
+  w "\n   The box will REBOOT to apply, then check itself. Passes -> kept. Fails -> restored if you are still on the old\n"
+  w "   network, otherwise kept so you can fix it at the console.\n"
   w "   Apply and reboot now? [y/N]: "; read -r -u 3 ans
   [[ "${ans:-n}" =~ ^[Yy] ]] || { w "aborted.\n"; exec 3>&-; return 0; }
   exec 3>&-
@@ -521,12 +598,15 @@ cmd_wizard(){
 # ============================================================
 # options + help + dispatch
 # ============================================================
-parse_opts(){ IFACE=""; IP=""; CIDR=""; GW=""; DNS=""; APPLY=0; NO_REBOOT=0
+parse_opts(){ IFACE=""; IP=""; CIDR=""; GW=""; DNS=""; APPLY=0; NO_REBOOT=0; VERIFY_LIST=""
+  local vips="" t
   while [ $# -gt 0 ]; do case "$1" in
     --iface) IFACE=$2; shift 2;; --ip) IP=$2; shift 2;; --cidr) CIDR=$2; shift 2;;
     --gw) GW=$2; shift 2;; --dns) DNS=$2; shift 2;; --apply) APPLY=1; shift;;
+    --verify-ip) vips=$2; shift 2;;
     --no-reboot) NO_REBOOT=1; shift;;
-    *) die "unknown option: $1";; esac; done; }
+    *) die "unknown option: $1";; esac; done
+  for t in ${vips//,/ }; do valid_ip "$t" || die "bad --verify-ip: '$t'"; VERIFY_LIST="${VERIFY_LIST:+$VERIFY_LIST }$t"; done; }
 
 usage(){ cat <<EOF
 ${BLD}pentera-helper${RST} — all-in-one: diagnose failures, seamless network setup, sane clock & certs.
@@ -537,17 +617,21 @@ ${BLD}DIAGNOSE${RST}
 
 ${BLD}NETWORK${RST}  (dry-run unless --apply; --apply writes the config and REBOOTS)
   wizard                            Interactive Pentera-style setup (static/DHCP).
-  set-static --ip A.B.C.D --cidr N --gw G [--dns "a,b"] [--iface IF] [--apply] [--no-reboot]
-  set-dhcp   [--iface IF] [--dns "a,b"] [--apply] [--no-reboot]
-  sync-iface [--iface IF] [--apply] [--no-reboot]   Realign management/attack/compose to the NIC.
+  set-static --ip A.B.C.D --cidr N --gw G [--dns "a,b"] [--iface IF] [--verify-ip "a,b"] [--apply] [--no-reboot]
+  set-dhcp   [--iface IF] [--dns "a,b"] [--verify-ip "a,b"] [--apply] [--no-reboot]
+  sync-iface [--iface IF] [--verify-ip "a,b"] [--apply] [--no-reboot]   Realign management/attack/compose to the NIC.
   Every change also syncs the interface into netplan + network.conf + compose.
 
 ${BLD}HOW --apply WORKS${RST}
   1. backs up netplan + network.conf + compose, writes the new config
   2. sets the hardware clock to the current UTC so the next boot starts on the right time
   3. reboots (10s countdown; --no-reboot = apply on the next reboot instead)
-  4. after boot it checks itself:  gateway answers within ${NET_WAIT}s -> change KEPT
-                                   gateway silent             -> old config restored + one more reboot
+  4. after boot it checks itself (ping, or ARP if ping is blocked):
+       gateway answers within ${NET_WAIT}s -> change KEPT
+       gateway silent, old network still there   -> old config restored + one more reboot (max 1, never a loop)
+       gateway silent, you moved networks        -> new config KEPT (the old one could not work here); fix at the console
+     --verify-ip 10.20.0.5,8.8.8.8 adds hosts to ping: the change passes if the gateway OR any of them answers.
+       isolated VLAN (no internet): give a neighbour on that VLAN.  Internet but the gateway blocks ping: give 8.8.8.8.
      future-dated certificates found after boot -> regenerated automatically
   Result: 'pentera-helper status'.  commit = keep a staged change without the check; rollback = restore last backup.
 
@@ -573,6 +657,7 @@ case "$cmd" in
     if [ "$cmd" = set-static ]; then
       [ -n "$IP" ] && [ -n "$CIDR" ] && [ -n "$GW" ] || die "set-static needs --ip, --cidr and --gw"
       valid_ip "$IP" || die "bad --ip"; valid_ip "$GW" || die "bad --gw"
+      why_bad=$(gw_check "$IP" "$CIDR" "$GW") || die "$why_bad"
     fi
     [ "$APPLY" = 1 ] && { need_root "$cmd"; BK=$(make_backup); }
     case "$cmd" in
