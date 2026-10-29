@@ -34,8 +34,10 @@ This installs `/usr/local/sbin/pentera-helper` and runs `fix-time` (below). Remo
 
 ## How a network change works
 
-1. Backs up netplan, `network.conf` and the compose files (`/etc/pentera/backup/helper/net-*`).
-2. Writes the new config and syncs the interface into **all three** places (netplan, `network.conf`, compose).
+1. Backs up netplan, `network.conf`, `dns_config.json` and the compose files (`/etc/pentera/backup/helper/net-*`).
+2. Writes the new config and syncs the interface into **all four** places (netplan, `network.conf`,
+   `dns_config.json`, compose). `dns_config.json` matters most: Pentera re-renders the compose `NETWORK_INTERFACE`
+   from its `pentera_network_interface` on every start, so a stale name there undoes any compose edit.
 3. Reboots (10 s countdown, Ctrl-C cancels).
 4. After boot it checks itself (within 90 s, ping or ARP if ping is blocked). The change passes if the **gateway
    answers, or any `--verify-ip` host does**. Pentera's certificates are re-issued for the new IP by Pentera itself;

@@ -26,6 +26,7 @@ LOGDIR=/var/log/pentera
 CLI_LOG=$LOGDIR/deployment/pentera-cli.log
 NETPLAN=/etc/netplan/00-installer-config.yaml
 NCONF=/etc/pentera/network/network.conf
+DNSCONF=/etc/pentera/network/dns_config.json    # pentera_network_interface: SOURCE of compose NETWORK_INTERFACE (re-rendered on every start)
 COMPOSE_DIR=/etc/pentera/compose
 SSL_DIR=/etc/ssl/pentera                      # node keystore + UI certs (the CA lives in /etc/ssl/ca)
 BKROOT=/etc/pentera/backup/helper
@@ -59,6 +60,7 @@ gw_ok(){
 }
 get_conf(){ $SUDO awk -F'=' -v k="$1" '$0 ~ "^[[:space:]]*"k {gsub(/[[:space:]]/,"",$2);print $2;exit}' "$NCONF" 2>/dev/null; }
 get_compose_if(){ $SUDO grep -rhoE 'NETWORK_INTERFACE=[^[:space:]"]+' "$COMPOSE_DIR"/ 2>/dev/null | head -1 | cut -d= -f2; }
+get_dnsconf_if(){ $SUDO sed -nE 's/.*"pentera_network_interface"[[:space:]]*:[[:space:]]*"([^"]*)".*/\1/p' "$DNSCONF" 2>/dev/null | head -1; }
 netplan_mode(){ $SUDO grep -qE 'dhcp4:[[:space:]]*true' "$NETPLAN" 2>/dev/null && echo dhcp || { $SUDO grep -qE 'addresses:' "$NETPLAN" 2>/dev/null && echo static || echo unknown; }; }
 # timedatectl doesn't track ntpd reliably (says "no" while ntpd is synced), so ask ntpd too
 ntp_synced(){ [ "$(timedatectl show -p NTPSynchronized --value 2>/dev/null)" = yes ] || /usr/sbin/ntp-wait -n 1 -s 1 >/dev/null 2>&1; }
@@ -97,20 +99,26 @@ net_report(){
   return 0
 }
 
-MM=""; mgmt_if=""; atk_if=""; comp_if=""
-iface_check(){   # prints roles, sets MM (+ mgmt_if/atk_if/comp_if)
-  local phys; mgmt_if=$(get_conf management_interface); atk_if=$(get_conf attack_interface); comp_if=$(get_compose_if)
+MM=""; mgmt_if=""; atk_if=""; comp_if=""; dns_if=""
+iface_check(){   # prints roles, sets MM (+ mgmt_if/atk_if/comp_if/dns_if)
+  local phys; mgmt_if=$(get_conf management_interface); atk_if=$(get_conf attack_interface); comp_if=$(get_compose_if); dns_if=$(get_dnsconf_if)
   phys=$(phys_ifaces | paste -sd' ' -)
   printf "network.conf management_interface : %s\n" "${mgmt_if:-?}"
   printf "network.conf attack_interface     : %s\n" "${atk_if:-?}"
+  printf "dns_config pentera_network_iface  : %s   (source of compose — Pentera re-renders compose from it on every start)\n" "${dns_if:-?}"
   printf "compose  NETWORK_INTERFACE        : %s\n" "${comp_if:-?}"
   printf "real physical NIC(s)              : %s\n" "${phys:-none}"
   MM=""
   [ -n "$mgmt_if" ] && ! is_phys "$mgmt_if" && MM="management_interface '$mgmt_if' is not a real NIC"
   [ -n "$atk_if" ]  && ! is_phys "$atk_if"  && MM="${MM:+$MM; }attack_interface '$atk_if' is not a real NIC"
+  [ -n "$dns_if" ]  && ! is_phys "$dns_if"  && MM="${MM:+$MM; }dns_config pentera_network_interface '$dns_if' is not a real NIC"
+  [ -n "$dns_if" ]  && [ -n "$atk_if" ] && [ "$dns_if" != "$atk_if" ] && MM="${MM:+$MM; }dns_config '$dns_if' != attack_interface '$atk_if'"
   [ -n "$comp_if" ] && ! is_phys "$comp_if" && MM="${MM:+$MM; }compose NETWORK_INTERFACE '$comp_if' is not a real NIC"
   [ -n "$comp_if" ] && [ -n "$atk_if" ] && [ "$comp_if" != "$atk_if" ] && MM="${MM:+$MM; }compose '$comp_if' != attack_interface '$atk_if'"
-  if [ -n "$MM" ]; then printf "${RED}MISMATCH: %s${RST}\n" "$MM"; else printf "${GRN}roles consistent (all point at the same real NIC)${RST}\n"; fi
+  if [ -n "$MM" ]; then
+    printf "${RED}MISMATCH: %s${RST}\n" "$MM"
+    [ -n "$dns_if" ] && [ "$dns_if" = "$comp_if" ] && [ "$dns_if" != "$atk_if" ] && printf "${YEL}note: compose follows dns_config.json — editing compose alone is undone on the next Pentera start${RST}\n"
+  else printf "${GRN}roles consistent (all point at the same real NIC)${RST}\n"; fi
 }
 
 # certificates dated in the future = minted while the clock was ahead (e.g. boot after Windows)
@@ -182,6 +190,10 @@ cmd_diagnose(){
   if [ "$active" = "active" ]; then
     sec "Node health"
     if [ -n "$FUT" ]; then sec "VERDICT"; printf "%s\n\n" "$FUT_VERDICT"
+    elif [ -n "$MM" ]; then sec "VERDICT"; printf "${YEL}Service runs, but the INTERFACE ROLES DISAGREE${RST}: %s
+Pentera binds its attack side to the compose NETWORK_INTERFACE, which it re-renders from dns_config.json on every
+start — a stale NIC name there (e.g. an old USB adapter) survives any compose edit. Attacks may not leave the box.
+${BLD}FIX:${RST} sudo pentera-helper sync-iface --apply   (updates network.conf + dns_config.json + compose, then reboots)\n\n" "$MM"
     elif node_health; then sec "VERDICT"; printf "${YEL}Service runs but node-checks hit TLS errors.${RST} Check the time/cert lines above; if they are clean, the errors are old.\n\n"
     else printf "${GRN}Service running, certificates valid, no node TLS errors — nothing to interpret.${RST}\n\n"; fi
     return 0
@@ -207,9 +219,9 @@ cmd_diagnose(){
   sec "VERDICT"
   if [ -n "$MM" ]; then
     reason="${RED}INTERFACE ROLE MISMATCH${RST}: $MM
-Pentera's configured NIC name doesn't match the real hardware (or network.conf and compose drifted).
-The attack bridge can't bind to a NIC that isn't there -> nodes fail. Usual cause after moving the
-appliance to a different VM/host/subnet.
+Pentera's configured NIC name doesn't match the real hardware (or network.conf, dns_config.json and compose drifted).
+The attack bridge can't bind to a NIC that isn't there -> nodes fail. Usual cause: a different USB/ethernet adapter
+(enx<MAC> names change with the adapter), or moving the appliance to a different VM/host.
 ${BLD}FIX:${RST} sudo pentera-helper sync-iface --apply"
   elif [ -n "$FUT" ]; then reason="$FUT_VERDICT"
   elif [ -z "$(default_gw)" ]; then
@@ -366,11 +378,13 @@ cmd_regen_certs(){
 # backup / staging / verify-after-reboot
 # ============================================================
 make_backup(){ local bk="$BKROOT/net-$(date -u +%Y%m%d-%H%M%S)"; mkdir -p "$bk"
-  [ -f "$NETPLAN" ] && cp -a "$NETPLAN" "$bk/"; [ -f "$NCONF" ] && cp -a "$NCONF" "$bk/"; cp -a "$COMPOSE_DIR" "$bk/compose" 2>/dev/null
+  [ -f "$NETPLAN" ] && cp -a "$NETPLAN" "$bk/"; [ -f "$NCONF" ] && cp -a "$NCONF" "$bk/"; [ -f "$DNSCONF" ] && cp -a "$DNSCONF" "$bk/"
+  cp -a "$COMPOSE_DIR" "$bk/compose" 2>/dev/null
   ln -sfn "$bk" "$BKROOT/last"; echo "$bk"; }
 restore_backup(){ local bk=$1
   [ -f "$bk/$(basename "$NETPLAN")" ] && cp -a "$bk/$(basename "$NETPLAN")" "$NETPLAN"
   [ -f "$bk/$(basename "$NCONF")" ]   && cp -a "$bk/$(basename "$NCONF")" "$NCONF"
+  [ -f "$bk/$(basename "$DNSCONF")" ] && cp -a "$bk/$(basename "$DNSCONF")" "$DNSCONF"
   [ -d "$bk/compose" ] && cp -a "$bk/compose/." "$COMPOSE_DIR/"; return 0; }
 
 install_self(){ [ "$(readlink -f "$0")" = "$SELF" ] || install -m 755 "$(readlink -f "$0")" "$SELF"; }
@@ -448,6 +462,8 @@ cmd_verify_boot(){   # run once by pentera-helper-verify.service after the reboo
   echo "network: OK — $proof, $IFACE = $(ip -4 -o addr show dev "$IFACE" 2>/dev/null | awk '{print $4}')"
   for i in $(seq 1 240); do [ "$(systemctl is-active "$SVC")" = active ] && break; sleep 5; done
   echo "pentera: $(systemctl is-active "$SVC")"
+  # Pentera re-renders compose on start — check the roles survived it
+  iface_check >/dev/null; if [ -n "$MM" ]; then echo "roles: MISMATCH after start — $MM"; else echo "roles: consistent"; fi
   fut=$(future_certs)
   if [ -n "$fut" ]; then
     echo "certificates: future-dated:"; echo "$fut"
@@ -507,13 +523,16 @@ plan_netplan(){   # mode iface ip cidr gw dns apply
 plan_roles(){   # iface apply
   local ifc=$1 apply=$2
   is_phys "$ifc" || die "'$ifc' is not a real NIC (have: $(phys_ifaces | paste -sd, -))"
-  sec "Interface roles -> $ifc (netplan + network.conf + compose)"
+  sec "Interface roles -> $ifc (netplan + network.conf + dns_config.json + compose)"
   printf "  management_interface      : %s -> %s\n" "$(get_conf management_interface)" "$ifc"
   printf "  attack_interface          : %s -> %s\n" "$(get_conf attack_interface)" "$ifc"
+  printf "  dns_config network iface  : %s -> %s\n" "$(get_dnsconf_if)" "$ifc"
   printf "  compose NETWORK_INTERFACE : %s -> %s\n" "$(get_compose_if)" "$ifc"
   [ "$apply" = 1 ] || return 0
   sed -i -E "s|^([[:space:]]*management_interface[[:space:]]*=[[:space:]]*).*|\1$ifc|" "$NCONF"
   sed -i -E "s|^([[:space:]]*attack_interface[[:space:]]*=[[:space:]]*).*|\1$ifc|"     "$NCONF"
+  # compose is re-rendered from dns_config.json on every Pentera start, so this is the edit that sticks
+  [ -f "$DNSCONF" ] && sed -i -E "s|(\"pentera_network_interface\"[[:space:]]*:[[:space:]]*\")[^\"]*|\1$ifc|" "$DNSCONF"
   grep -rlE 'NETWORK_INTERFACE=' "$COMPOSE_DIR"/ 2>/dev/null | while read -r f; do sed -i -E "s|(NETWORK_INTERFACE=)[^[:space:]\"]+|\1$ifc|g" "$f"; done
 }
 
@@ -591,7 +610,11 @@ cmd_wizard(){
   BK=$(make_backup)
   plan_netplan "$mode" "$mgmt" "$ip" "$cidr" "$gw" "$dns" 1
   plan_roles "$mgmt" 1
-  [ "$atk" != "$mgmt" ] && sed -i -E "s|^([[:space:]]*attack_interface[[:space:]]*=[[:space:]]*).*|\1$atk|" "$NCONF"
+  if [ "$atk" != "$mgmt" ]; then
+    sed -i -E "s|^([[:space:]]*attack_interface[[:space:]]*=[[:space:]]*).*|\1$atk|" "$NCONF"
+    [ -f "$DNSCONF" ] && sed -i -E "s|(\"pentera_network_interface\"[[:space:]]*:[[:space:]]*\")[^\"]*|\1$atk|" "$DNSCONF"
+    grep -rlE 'NETWORK_INTERFACE=' "$COMPOSE_DIR"/ 2>/dev/null | while read -r f; do sed -i -E "s|(NETWORK_INTERFACE=)[^[:space:]\"]+|\1$atk|g" "$f"; done
+  fi
   stage_reboot "$BK" "$gw" "$mgmt"
 }
 
