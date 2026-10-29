@@ -426,9 +426,16 @@ stage_reboot(){   # $1 backup dir   $2 expected gateway ("" = take it from DHCP 
   else printf "  ${YEL}clock   : NTP not synced — hardware clock not touched${RST}\n"; fi
   [ -f "$DROPIN" ] || printf "  ${YEL}tip     : time guardrail not installed (sudo pentera-helper fix-time)${RST}\n"
   if [ "${NO_REBOOT:-0}" = 1 ]; then printf "\nNot rebooting (--no-reboot). The change applies and is verified on the next reboot.\n"; return 0; fi
-  printf "\n${BLD}Rebooting in 10s to apply.${RST} Ctrl-C cancels the reboot (the change stays staged for the next one).\n"
+  printf "\nCtrl-C cancels the reboot (the change stays staged for the next one).\n"
   printf "After boot check the result with:  sudo pentera-helper status\n"
-  sleep 10; systemctl reboot
+  countdown 10 "the change stays staged and applies on the next reboot"; systemctl reboot
+}
+
+countdown(){   # secs  what-ctrl-c-leaves-behind — live "Rebooting in N s" line; Ctrl-C aborts the script, not just the sleep
+  local n=$1
+  trap 'printf "\n${YEL}Reboot cancelled${RST} — %s.\n" "$2"; exit 130' INT
+  while [ "$n" -gt 0 ]; do printf "\r${BLD}Rebooting in %2ds...${RST} " "$n"; sleep 1; n=$((n-1)); done
+  trap - INT; printf "\r${BLD}Rebooting now.${RST}        \n"
 }
 
 cmd_verify_boot(){   # run once by pentera-helper-verify.service after the reboot
@@ -479,7 +486,7 @@ cmd_commit(){ need_root commit
 cmd_rollback(){ need_root rollback
   local bk; bk=$(readlink -f "$BKROOT/last" 2>/dev/null); [ -d "$bk" ] || die "no backup found"
   restore_backup "$bk"; rm -f "$PENDING"; systemctl disable "$VERIFY_UNIT" >/dev/null 2>&1
-  printf "Restored %s. Rebooting in 10s to apply (Ctrl-C to cancel).\n" "$bk"; sleep 10; systemctl reboot; }
+  printf "Restored %s. Ctrl-C cancels the reboot.\n" "$bk"; countdown 10 "the restored config applies on the next reboot"; systemctl reboot; }
 
 # ============================================================
 # netplan + interface roles (write only; the reboot applies them)
