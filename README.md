@@ -50,10 +50,10 @@ sudo pentera-helper regen-certs                  # re-mint node/UI certs on the 
 |---|---|---|
 | `diagnose [--net\|--iface\|--time]` | Always prints network info, interface roles, time and certificates, then a plain-language verdict. | no |
 | `status` | NICs, roles, netplan, time, staged change, last verification. | no |
-| `wizard` | Interactive static/DHCP setup. | only if you answer `y` |
+| `wizard` | Interactive: every option of a network change, no flags needed. | `y` = now, `l` = next reboot |
 | `set-static --ip A --cidr N --gw G [--dns a,b] [--iface IF] [--verify-ip a,b]` | Static IP. | with `--apply` |
 | `set-dhcp [--iface IF] [--dns a,b] [--verify-ip a,b]` | DHCP. | with `--apply` |
-| `sync-iface [--iface IF] [--verify-ip a,b]` | Realign the interface names only; IP settings untouched. | with `--apply` |
+| `sync-iface [--iface IF] [--verify-ip a,b]` | Move the NIC name everywhere (netplan too); IP settings untouched. | with `--apply` |
 | `fix-time [--tz Area/City] [--rtc local\|utc\|auto]` | Time guardrails. | no |
 | `regen-certs [--force]` | Re-mint node/UI certificates (CA untouched). | restarts Pentera |
 | `commit` / `rollback` | Accept a staged change without the check / restore the last backup. | rollback reboots |
@@ -62,11 +62,18 @@ sudo pentera-helper regen-certs                  # re-mint node/UI certs on the 
 
 ## The wizard
 
-1. **Management interface** — pick from the real NICs (Enter = the detected one).
-2. **IP assignment** — Static (IP, prefix, gateway, DNS) or DHCP.
-3. **Attack interface** — same as management by default.
-4. **Connectivity check** — optional extra IPs; after the reboot the change passes if the gateway **or** any of them answers.
-5. **Review** → `Apply and reboot now? [y/N]`. **`y` is the apply** — no `--apply` flag needed. Enter/`n` writes nothing.
+`sudo pentera-helper wizard` asks for everything a network change needs, so you never have to remember a flag:
+
+| Step | Asks | Same as |
+|---|---|---|
+| 1. Management interface | pick from the real NICs (Enter = the detected one) | `--iface` |
+| 2. IP assignment | **Static** (IP, prefix, gateway, DNS) · **DHCP** (optional DNS override) · **Keep current** (only move the settings to the chosen NIC) | `set-static` · `set-dhcp` · `sync-iface` |
+| 3. Attack interface | same as management by default | |
+| 4. Connectivity check | extra IPs; after the reboot the change passes if the gateway **or** any of them answers | `--verify-ip` |
+| 5. Clock | timezone and hardware-clock mode (suggests `Asia/Manila` + `local` on a Windows dual-boot still set to UTC) | `fix-time --tz --rtc` |
+| Review | `[y]` apply + reboot now · `[l]` apply, reboot later · `[N]` abort (writes nothing) | `--apply` · `--no-reboot` |
+
+After an adapter swap, pick **Keep current** in step 2: the IP settings stay, only the NIC name moves.
 
 ## How a change is applied
 

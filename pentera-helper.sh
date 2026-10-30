@@ -61,6 +61,8 @@ gw_ok(){
 get_conf(){ $SUDO awk -F'=' -v k="$1" '$0 ~ "^[[:space:]]*"k {gsub(/[[:space:]]/,"",$2);print $2;exit}' "$NCONF" 2>/dev/null; }
 get_compose_if(){ $SUDO grep -rhoE 'NETWORK_INTERFACE=[^[:space:]"]+' "$COMPOSE_DIR"/ 2>/dev/null | head -1 | cut -d= -f2; }
 get_dnsconf_if(){ $SUDO sed -nE 's/.*"pentera_network_interface"[[:space:]]*:[[:space:]]*"([^"]*)".*/\1/p' "$DNSCONF" 2>/dev/null | head -1; }
+# first NIC key under "ethernets:" in our netplan file
+netplan_if(){ $SUDO awk '/^[[:space:]]*ethernets:/{f=1;next} f && /^[[:space:]]+[A-Za-z0-9_.-]+:[[:space:]]*$/{sub(/^[[:space:]]+/,"");sub(/:.*/,"");print;exit}' "$NETPLAN" 2>/dev/null; }
 netplan_mode(){ $SUDO grep -qE 'dhcp4:[[:space:]]*true' "$NETPLAN" 2>/dev/null && echo dhcp || { $SUDO grep -qE 'addresses:' "$NETPLAN" 2>/dev/null && echo static || echo unknown; }; }
 # timedatectl doesn't track ntpd reliably (says "no" while ntpd is synced), so ask ntpd too
 ntp_synced(){ [ "$(timedatectl show -p NTPSynchronized --value 2>/dev/null)" = yes ] || /usr/sbin/ntp-wait -n 1 -s 1 >/dev/null 2>&1; }
@@ -99,17 +101,20 @@ net_report(){
   return 0
 }
 
-MM=""; mgmt_if=""; atk_if=""; comp_if=""; dns_if=""
-iface_check(){   # prints roles, sets MM (+ mgmt_if/atk_if/comp_if/dns_if)
-  local phys; mgmt_if=$(get_conf management_interface); atk_if=$(get_conf attack_interface); comp_if=$(get_compose_if); dns_if=$(get_dnsconf_if)
+MM=""; mgmt_if=""; atk_if=""; comp_if=""; dns_if=""; np_if=""
+iface_check(){   # prints roles, sets MM (+ mgmt_if/atk_if/comp_if/dns_if/np_if)
+  local phys; mgmt_if=$(get_conf management_interface); atk_if=$(get_conf attack_interface); comp_if=$(get_compose_if); dns_if=$(get_dnsconf_if); np_if=$(netplan_if)
   phys=$(phys_ifaces | paste -sd' ' -)
+  printf "netplan ethernets                 : %s\n" "${np_if:-?}"
   printf "network.conf management_interface : %s\n" "${mgmt_if:-?}"
   printf "network.conf attack_interface     : %s\n" "${atk_if:-?}"
   printf "dns_config pentera_network_iface  : %s   (source of compose — Pentera re-renders compose from it on every start)\n" "${dns_if:-?}"
   printf "compose  NETWORK_INTERFACE        : %s\n" "${comp_if:-?}"
   printf "real physical NIC(s)              : %s\n" "${phys:-none}"
   MM=""
-  [ -n "$mgmt_if" ] && ! is_phys "$mgmt_if" && MM="management_interface '$mgmt_if' is not a real NIC"
+  [ -n "$np_if" ]   && ! is_phys "$np_if"   && MM="netplan configures '$np_if', which is not a real NIC (no IP after the next reboot)"
+  [ -n "$np_if" ]   && [ -n "$mgmt_if" ] && [ "$np_if" != "$mgmt_if" ] && MM="${MM:+$MM; }netplan '$np_if' != management_interface '$mgmt_if'"
+  [ -n "$mgmt_if" ] && ! is_phys "$mgmt_if" && MM="${MM:+$MM; }management_interface '$mgmt_if' is not a real NIC"
   [ -n "$atk_if" ]  && ! is_phys "$atk_if"  && MM="${MM:+$MM; }attack_interface '$atk_if' is not a real NIC"
   [ -n "$dns_if" ]  && ! is_phys "$dns_if"  && MM="${MM:+$MM; }dns_config pentera_network_interface '$dns_if' is not a real NIC"
   [ -n "$dns_if" ]  && [ -n "$atk_if" ] && [ "$dns_if" != "$atk_if" ] && MM="${MM:+$MM; }dns_config '$dns_if' != attack_interface '$atk_if'"
@@ -193,7 +198,7 @@ cmd_diagnose(){
     elif [ -n "$MM" ]; then sec "VERDICT"; printf "${YEL}Service runs, but the INTERFACE ROLES DISAGREE${RST}: %s
 Pentera binds its attack side to the compose NETWORK_INTERFACE, which it re-renders from dns_config.json on every
 start — a stale NIC name there (e.g. an old USB adapter) survives any compose edit. Attacks may not leave the box.
-${BLD}FIX:${RST} sudo pentera-helper sync-iface --apply   (updates network.conf + dns_config.json + compose, then reboots)\n\n" "$MM"
+${BLD}FIX:${RST} sudo pentera-helper sync-iface --apply   (updates netplan + network.conf + dns_config.json + compose, then reboots)\n\n" "$MM"
     elif node_health; then sec "VERDICT"; printf "${YEL}Service runs but node-checks hit TLS errors.${RST} Check the time/cert lines above; if they are clean, the errors are old.\n\n"
     else printf "${GRN}Service running, certificates valid, no node TLS errors — nothing to interpret.${RST}\n\n"; fi
     return 0
@@ -535,7 +540,14 @@ plan_roles(){   # iface apply
   printf "  attack_interface          : %s -> %s\n" "$(get_conf attack_interface)" "$ifc"
   printf "  dns_config network iface  : %s -> %s\n" "$(get_dnsconf_if)" "$ifc"
   printf "  compose NETWORK_INTERFACE : %s -> %s\n" "$(get_compose_if)" "$ifc"
+  printf "  netplan ethernets         : %s -> %s\n" "$(netplan_if)" "$ifc"
   [ "$apply" = 1 ] || return 0
+  # keep the IP settings, move them to the NIC (an adapter swap leaves netplan on the old enx<mac> name)
+  local np; np=$(netplan_if)
+  if [ -n "$np" ] && [ "$np" != "$ifc" ]; then
+    sed -i -E "s|^([[:space:]]+)$np:[[:space:]]*$|\1$ifc:|" "$NETPLAN"
+    netplan generate 2>/tmp/ph.err || { restore_backup "$BK"; cat /tmp/ph.err >&2; die "netplan rejected the renamed config — restored, nothing staged"; }
+  fi
   sed -i -E "s|^([[:space:]]*management_interface[[:space:]]*=[[:space:]]*).*|\1$ifc|" "$NCONF"
   sed -i -E "s|^([[:space:]]*attack_interface[[:space:]]*=[[:space:]]*).*|\1$ifc|"     "$NCONF"
   # compose is re-rendered from dns_config.json on every Pentera start, so this is the edit that sticks
@@ -554,7 +566,7 @@ cmd_wizard(){
   [ "$(id -u)" -eq 0 ] || die "run the wizard with sudo:  sudo pentera-helper wizard"
   exec 3<>/dev/tty || die "wizard needs an interactive terminal (tty)"
   w(){ printf "%b" "$*" >&3; }
-  local def mgmt mode ip="" cidr="" gw="" dns="" atk ans i n bad; declare -a NICS
+  local def mgmt mode ip="" cidr="" gw="" dns="" atk ans i n bad cur_tz tz def_tz rtc def_rtc when; declare -a NICS
   w "${BLD}+----------------------------------------------+\n"
   w "|       Pentera Helper — Network Setup          |\n"
   w "+----------------------------------------------+${RST}\n"
@@ -566,8 +578,11 @@ cmd_wizard(){
   [[ "$mgmt" =~ ^[0-9]+$ ]] && mgmt=${NICS[$((mgmt-1))]:-}; is_phys "$mgmt" || die "invalid interface: $mgmt"
 
   w "\n${BLD}2) IP assignment${RST}\n"
-  w "   [1] Static   [2] DHCP   -> choose [1]: "; read -r -u 3 ans; ans=${ans:-1}
-  if [ "$ans" = 2 ]; then
+  w "   [1] Static   [2] DHCP   [3] Keep the current settings ($(netplan_mode)), only move them to $mgmt\n"
+  w "   -> choose [1]: "; read -r -u 3 ans; ans=${ans:-1}
+  if [ "$ans" = 3 ]; then
+    mode=keep; gw=$(default_gw)    # = sync-iface
+  elif [ "$ans" = 2 ]; then
     mode=dhcp
     w "   Override DNS (comma list, blank = from DHCP): "; read -r -u 3 dns
   else
@@ -603,25 +618,52 @@ cmd_wizard(){
     w "   ${RED}invalid IP: $bad — try again${RST}\n"
   done
 
+  # the reboot reads the hardware clock: zone + RTC mode decide whether the box comes up on the right time
+  w "\n${BLD}5) Clock${RST}\n"
+  cur_tz=$(timedatectl show -p Timezone --value 2>/dev/null); def_tz=${cur_tz:-UTC}
+  if dual_boot && [[ "$def_tz" =~ ^(Etc/)?UTC$ ]]; then
+    def_tz=Asia/Manila
+    w "   ${YEL}Windows is on this disk and the timezone is $cur_tz. Windows writes LOCAL time to the hardware clock,\n"
+    w "   so set your real zone or Ubuntu boots hours off after a Windows session.${RST}\n"
+  fi
+  while :; do
+    w "   Timezone [$def_tz]: "; read -r -u 3 tz; tz=${tz:-$def_tz}
+    { [ -f "/usr/share/zoneinfo/$tz" ] || timedatectl list-timezones 2>/dev/null | grep -qx "$tz"; } && break
+    w "   ${RED}unknown timezone '$tz' (e.g. Asia/Manila, Asia/Singapore, UTC)${RST}\n"
+  done
+  dual_boot && def_rtc=local || def_rtc=utc
+  w "   Hardware clock mode: [1] local (same as Windows)  [2] utc   -> [$def_rtc]: "; read -r -u 3 ans
+  case "$ans" in 1|local) rtc=local ;; 2|utc) rtc=utc ;; *) rtc=$def_rtc ;; esac
+
   w "\n${BLD}Review${RST}\n"
-  w "   management = $mgmt\n   attack     = $atk\n   mode       = $mode\n"
-  [ "$mode" = static ] && w "   address    = $ip/$cidr\n   gateway    = $gw\n"
-  w "   dns        = ${dns:-auto}\n"
+  w "   management = $mgmt\n   attack     = $atk\n"
+  case "$mode" in
+    static) w "   mode       = static\n   address    = $ip/$cidr\n   gateway    = $gw\n   dns        = $dns\n" ;;
+    dhcp)   w "   mode       = dhcp\n   dns        = ${dns:-from DHCP}\n" ;;
+    keep)   w "   mode       = keep current ($(netplan_mode)), netplan '$(netplan_if)' -> $mgmt\n" ;;
+  esac
   w "   check      = gateway${VERIFY_LIST:+ or any of: $VERIFY_LIST}\n"
-  w "\n   The box will REBOOT to apply, then check itself. Passes -> kept. Fails -> restored if you are still on the old\n"
-  w "   network, otherwise kept so you can fix it at the console.\n"
-  w "   Apply and reboot now? [y/N]: "; read -r -u 3 ans
-  [[ "${ans:-n}" =~ ^[Yy] ]] || { w "aborted.\n"; exec 3>&-; return 0; }
+  w "   clock      = $tz, hardware clock $rtc\n"
+  w "\n   Applying REBOOTS the box, then it checks itself. Passes -> kept. Fails -> restored if you are still on the\n"
+  w "   old network, otherwise kept so you can fix it at the console.\n"
+  w "   [y] apply + reboot now   [l] apply, reboot later (checked on the next boot)   [N] abort: "; read -r -u 3 when
+  case "$when" in
+    [Yy]*) NO_REBOOT=0 ;;
+    [Ll]*) NO_REBOOT=1 ;;
+    *) w "aborted — nothing written.\n"; exec 3>&-; return 0 ;;
+  esac
   exec 3>&-
 
   BK=$(make_backup)
-  plan_netplan "$mode" "$mgmt" "$ip" "$cidr" "$gw" "$dns" 1
+  [ "$mode" = keep ] || plan_netplan "$mode" "$mgmt" "$ip" "$cidr" "$gw" "$dns" 1
   plan_roles "$mgmt" 1
   if [ "$atk" != "$mgmt" ]; then
     sed -i -E "s|^([[:space:]]*attack_interface[[:space:]]*=[[:space:]]*).*|\1$atk|" "$NCONF"
     [ -f "$DNSCONF" ] && sed -i -E "s|(\"pentera_network_interface\"[[:space:]]*:[[:space:]]*\")[^\"]*|\1$atk|" "$DNSCONF"
     grep -rlE 'NETWORK_INTERFACE=' "$COMPOSE_DIR"/ 2>/dev/null | while read -r f; do sed -i -E "s|(NETWORK_INTERFACE=)[^[:space:]\"]+|\1$atk|g" "$f"; done
   fi
+  # before stage_reboot: it writes the hardware clock, which must use the RTC mode chosen here
+  ( cmd_fix_time --tz "$tz" --rtc "$rtc" ) || printf "${YEL}clock settings failed (see above) — network change still staged${RST}\n"
   stage_reboot "$BK" "$gw" "$mgmt"
 }
 
@@ -646,10 +688,11 @@ ${BLD}DIAGNOSE${RST}
   status                            Read-only overview, incl. staged change + last verification.
 
 ${BLD}NETWORK${RST}  (dry-run unless --apply; --apply writes the config and REBOOTS)
-  wizard                            Interactive Pentera-style setup (static/DHCP).
+  wizard                            Interactive: every option below (NICs, static/DHCP/keep, verify IPs, timezone,
+                                    clock mode, reboot now or later) — no flags needed.
   set-static --ip A.B.C.D --cidr N --gw G [--dns "a,b"] [--iface IF] [--verify-ip "a,b"] [--apply] [--no-reboot]
   set-dhcp   [--iface IF] [--dns "a,b"] [--verify-ip "a,b"] [--apply] [--no-reboot]
-  sync-iface [--iface IF] [--verify-ip "a,b"] [--apply] [--no-reboot]   Realign management/attack/compose to the NIC.
+  sync-iface [--iface IF] [--verify-ip "a,b"] [--apply] [--no-reboot]   Move the NIC name everywhere (netplan, network.conf, dns_config, compose).
   Every change also syncs the interface into netplan + network.conf + compose.
 
 ${BLD}HOW --apply WORKS${RST}
